@@ -5555,7 +5555,7 @@ struct test_concat : public test_case {
     const std::array<int64_t, 4> ne_a;
     const int64_t ne_b_d;
     const int dim;
-    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim))
+    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim), 1 << 4: transposed b)
 
     std::string vars() override {
         return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
@@ -5590,7 +5590,15 @@ struct test_concat : public test_case {
             ggml_set_name(a, "a");
         }
         ggml_tensor * b;
-        if (v & 2) {
+        if (v & 16) {
+            // transposed b, as in the delta-net conv state concat
+            std::array<int64_t, 4> ne = { ne_b[1], ne_b[0], ne_b[2], ne_b[3] };
+            b = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_name(b, "b");
+
+            b = ggml_transpose(ctx, b);
+            ggml_set_name(b, "transpose_of_b");
+        } else if (v & 2) {
             auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
             b = ggml_new_tensor(ctx, type, 4, ne.data());
             ggml_set_name(b, "b");
@@ -9100,6 +9108,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 12, 13, 14}, 7, dim, v));
             test_cases.emplace_back(new test_concat(GGML_TYPE_I64, {11, 12, 13, 14}, 7, dim, v));
         }
+    }
+
+    // transposed b, including the qwen35 conv state shapes (prompt and single-token)
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        test_cases.emplace_back(new test_concat(type, {11, 12, 13, 14}, 7, 0, 16));
+        test_cases.emplace_back(new test_concat(type, {11, 12, 13, 14}, 7, 0, 17));
+        test_cases.emplace_back(new test_concat(type, {3, 300, 2, 1}, 70, 0, 16));
+        test_cases.emplace_back(new test_concat(type, {3, 6144, 1, 1}, 1, 0, 16));
+        test_cases.emplace_back(new test_concat(type, {3, 6144, 1, 1}, 512, 0, 16));
     }
 
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
