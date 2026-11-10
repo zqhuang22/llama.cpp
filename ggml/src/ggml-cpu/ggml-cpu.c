@@ -3153,7 +3153,190 @@ struct ggml_spert_context {
     struct ggml_cgraph *   cgraph;
     struct ggml_cplan  *   cplan;
     struct ggml_threadpool tp;  // shared across all tiles; only current_chunk is used
+    uint64_t *             node_ticks;  // [n_nodes] wall ticks + [n_nodes] n_fused+1, NULL unless profiling
 };
+
+
+// ---- per-node wall-time profiler for the spert whole-graph path ----
+// Enabled with GGML_SPACEMIT_OP_PROFILE=1 (report on stderr at exit) or =<file path>.
+// Tile 0 timestamps each node from its start until the post-node grid sync returns, so a
+// node's time is the slowest tile plus the barrier: the node's real cost on the AI cores.
+#define SMT_PROF_SLOTS 8192
+
+struct smt_prof_entry {
+    uint64_t hash;
+    uint64_t ticks;
+    uint64_t calls;
+    char     op[48];
+    char     name[64];
+    char     detail[200];
+};
+
+static struct smt_prof_entry * smt_prof_tab;
+static uint64_t                smt_prof_graph_ticks;
+static uint64_t                smt_prof_graphs;
+static const char *            smt_prof_out;
+
+static inline uint64_t smt_prof_now(void) {
+    uint64_t t;
+    __asm__ volatile("rdtime %0" : "=r"(t));
+    return t;
+}
+
+static bool smt_prof_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        smt_prof_out = getenv("GGML_SPACEMIT_OP_PROFILE");
+        enabled      = smt_prof_out != NULL && smt_prof_out[0] != '\0' && strcmp(smt_prof_out, "0") != 0;
+    }
+    return enabled == 1;
+}
+
+static double smt_prof_timebase(void) {
+    double hz = 24e6;
+    FILE * f  = fopen("/proc/device-tree/cpus/timebase-frequency", "rb");
+    if (f) {
+        unsigned char b[4];
+        if (fread(b, 1, 4, f) == 4) {
+            hz = (double) (((uint32_t) b[0] << 24) | ((uint32_t) b[1] << 16) | ((uint32_t) b[2] << 8) | b[3]);
+        }
+        fclose(f);
+    }
+    return hz;
+}
+
+static int smt_prof_cmp(const void * a, const void * b) {
+    const struct smt_prof_entry * x = (const struct smt_prof_entry *) a;
+    const struct smt_prof_entry * y = (const struct smt_prof_entry *) b;
+    return x->ticks < y->ticks ? 1 : x->ticks > y->ticks ? -1 : 0;
+}
+
+static void smt_prof_report(void) {
+    if (smt_prof_tab == NULL || smt_prof_graphs == 0) {
+        return;
+    }
+    FILE * out = stderr;
+    if (strcmp(smt_prof_out, "1") != 0) {
+        out = fopen(smt_prof_out, "w");
+        if (out == NULL) {
+            out = stderr;
+        }
+    }
+    const double ms = 1e3 / smt_prof_timebase();
+
+    int n = 0;
+    for (int i = 0; i < SMT_PROF_SLOTS; i++) {
+        if (smt_prof_tab[i].calls) {
+            smt_prof_tab[n++] = smt_prof_tab[i];
+        }
+    }
+    qsort(smt_prof_tab, n, sizeof(*smt_prof_tab), smt_prof_cmp);
+
+    uint64_t attributed = 0;
+    for (int i = 0; i < n; i++) {
+        attributed += smt_prof_tab[i].ticks;
+    }
+    fprintf(out, "# spacemit op profile: graphs=%llu graph_wall_ms=%.3f node_sum_ms=%.3f\n",
+            (unsigned long long) smt_prof_graphs, smt_prof_graph_ticks * ms, attributed * ms);
+
+    fprintf(out, "## by op\n#pct\ttotal_ms\tcalls\top\n");
+    for (int i = 0; i < n; i++) {
+        bool seen = false;
+        for (int j = 0; j < i && !seen; j++) {
+            seen = strcmp(smt_prof_tab[j].op, smt_prof_tab[i].op) == 0;
+        }
+        if (seen) {
+            continue;
+        }
+        uint64_t ticks = 0, calls = 0;
+        for (int j = i; j < n; j++) {
+            if (strcmp(smt_prof_tab[j].op, smt_prof_tab[i].op) == 0) {
+                ticks += smt_prof_tab[j].ticks;
+                calls += smt_prof_tab[j].calls;
+            }
+        }
+        fprintf(out, "%.2f\t%.3f\t%llu\t%s\n", 100.0 * ticks / attributed, ticks * ms,
+                (unsigned long long) calls, smt_prof_tab[i].op);
+    }
+
+    fprintf(out, "## by node kind\n#pct\ttotal_ms\tcalls\tavg_us\top\tname\tdst <- src0 , src1\n");
+    for (int i = 0; i < n; i++) {
+        const struct smt_prof_entry * e = &smt_prof_tab[i];
+        fprintf(out, "%.2f\t%.3f\t%llu\t%.1f\t%s\t%s\t%s\n", 100.0 * e->ticks / attributed, e->ticks * ms,
+                (unsigned long long) e->calls, e->ticks * ms * 1e3 / e->calls, e->op, e->name, e->detail);
+    }
+    if (out != stderr) {
+        fclose(out);
+    }
+}
+
+static int smt_prof_shape(char * buf, size_t size, const struct ggml_tensor * t) {
+    return snprintf(buf, size, "%s[%lld,%lld,%lld,%lld]", ggml_type_name(t->type), (long long) t->ne[0],
+                    (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+}
+
+static void smt_prof_accumulate(const struct ggml_cgraph * cgraph, const uint64_t * node_ticks, uint64_t graph_ticks) {
+    if (smt_prof_tab == NULL) {
+        smt_prof_tab = (struct smt_prof_entry *) calloc(SMT_PROF_SLOTS, sizeof(*smt_prof_tab));
+        if (smt_prof_tab == NULL) {
+            return;
+        }
+        atexit(smt_prof_report);
+    }
+    smt_prof_graphs++;
+    smt_prof_graph_ticks += graph_ticks;
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const uint64_t mark = node_ticks[cgraph->n_nodes + i];  // n_fused + 1 once the node ran
+        if (mark == 0) {
+            continue;
+        }
+        const struct ggml_tensor * t = cgraph->nodes[i];
+        const int n_fused = (int) mark - 1;
+
+        char op[48], name[64], detail[200];
+        if (n_fused > 0) {
+            snprintf(op, sizeof(op), "FUSED(%s+%d)", ggml_op_desc(t), n_fused);
+        } else {
+            snprintf(op, sizeof(op), "%s", ggml_op_desc(t));
+        }
+        // llama.cpp names per-layer tensors "<name>-<layer>": drop the layer so layers aggregate
+        snprintf(name, sizeof(name), "%s", t->name);
+        char * dash = strrchr(name, '-');
+        if (dash && dash[1] != '\0' && strspn(dash + 1, "0123456789") == strlen(dash + 1)) {
+            *dash = '\0';
+        }
+        int k = smt_prof_shape(detail, sizeof(detail), t);
+        for (int s = 0; s < 2 && t->src[s] && k < (int) sizeof(detail); s++) {
+            k += snprintf(detail + k, sizeof(detail) - k, s == 0 ? " <- " : " , ");
+            if (k < (int) sizeof(detail)) {
+                k += smt_prof_shape(detail + k, sizeof(detail) - k, t->src[s]);
+            }
+        }
+
+        uint64_t h = 1469598103934665603ULL;
+        for (const char * strs[3] = { op, name, detail }, ** p = strs; p < strs + 3; p++) {
+            for (const char * c = *p; *c; c++) {
+                h = (h ^ (unsigned char) *c) * 1099511628211ULL;
+            }
+            h = (h ^ '|') * 1099511628211ULL;
+        }
+        for (uint64_t probe = 0; probe < SMT_PROF_SLOTS; probe++) {
+            struct smt_prof_entry * e = &smt_prof_tab[(h + probe) % SMT_PROF_SLOTS];
+            if (e->calls == 0) {
+                e->hash = h;
+                snprintf(e->op, sizeof(e->op), "%s", op);
+                snprintf(e->name, sizeof(e->name), "%s", name);
+                snprintf(e->detail, sizeof(e->detail), "%s", detail);
+            } else if (e->hash != h) {
+                continue;
+            }
+            e->ticks += node_ticks[i];
+            e->calls += 1;
+            break;
+        }
+    }
+}
 
 // Graph traversal callback for spert whole-graph kernel.
 // Runs inside each AI core tile, called from adapter after setting t_spert_ctx.
@@ -3172,6 +3355,9 @@ static void ggml_graph_compute_spert_kernel(int ith, int nth, void * user_data) 
         /*.use_ref    =*/ cplan->use_ref,
     };
     
+    uint64_t * const prof   = (ith == 0) ? sctx->node_ticks : NULL;
+    uint64_t         prof_t = prof ? smt_prof_now() : 0;
+
     // Traverse the entire graph (same logic as ggml_graph_compute_thread)
     for (int node_n = 0; node_n < cgraph->n_nodes; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
@@ -3185,6 +3371,7 @@ static void ggml_graph_compute_spert_kernel(int ith, int nth, void * user_data) 
         }
         
         // Execute the operator (all ops go through here, including IME-accelerated ones)
+        const int prof_node = node_n;
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
@@ -3195,6 +3382,13 @@ static void ggml_graph_compute_spert_kernel(int ith, int nth, void * user_data) 
         // Sync after each node (replaces ggml_barrier in original threadpool path)
         if (node_n + 1 < cgraph->n_nodes) {
             spacemit_spert_grid_sync();
+        }
+
+        if (prof) {
+            const uint64_t t = smt_prof_now();
+            prof[prof_node] += t - prof_t;
+            prof[cgraph->n_nodes + prof_node] = (uint64_t) (n_fused > 0 ? n_fused : 0) + 1;
+            prof_t = t;
         }
     }
 }
@@ -3546,11 +3740,21 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         spert_ctx.tp.cplan      = cplan;
         atomic_store_explicit(&spert_ctx.tp.current_chunk, 0, memory_order_relaxed);
 
+        if (smt_prof_enabled()) {
+            spert_ctx.node_ticks = (uint64_t *) calloc(2 * (size_t) cgraph->n_nodes, sizeof(uint64_t));
+        }
+        const uint64_t prof_t0 = spert_ctx.node_ticks ? smt_prof_now() : 0;
+
         int launch_result = spacemit_spert_launch_graph_kernel(
             ggml_graph_compute_spert_kernel,
             &spert_ctx,
             n_tiles
         );
+
+        if (spert_ctx.node_ticks) {
+            smt_prof_accumulate(cgraph, spert_ctx.node_ticks, smt_prof_now() - prof_t0);
+            free(spert_ctx.node_ticks);
+        }
 
         clear_numa_thread_affinity();
         return (launch_result == 0) ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
