@@ -3205,6 +3205,203 @@ template <typename T> void forward_concat(ggml_compute_params * params, ggml_ten
     }
 }
 
+// ---- GATED_DELTA_NET, scalar gate, K = 1 ----
+// ggml stores each head's state transposed: row j of M is column j of S (M[j][i] = S[i][j]).
+// Short sequences (decode) update M in place one row at a time: decay the row, take both dot
+// products from it, apply the delta-rule correction and store it, so the state is read and
+// written once per token. Longer sequences copy the state transposed into a row-major W = S
+// (row i contiguous over j). Then S^T k and S^T q are plain vector multiply-adds over the rows
+// with no reductions, and while an updated row is still in registers it is accumulated into
+// the next token's products, so every token is a single load/store sweep over W. Two rows per
+// step with separate accumulators keep the multiply-add chains independent.
+// The output uses o = d S^T q + delta (k . q), i.e. the decayed state before the update.
+
+static constexpr int64_t gdn_rowmajor_min_tokens = 32;
+
+static inline float gdn_dot_f32m4(const float * x, const float * y, size_t vl) {
+    const vfloat32m4_t prod = __riscv_vfmul_vv_f32m4(__riscv_vle32_v_f32m4(x, vl), __riscv_vle32_v_f32m4(y, vl), vl);
+    return __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m4_f32m1(prod, __riscv_vfmv_v_f_f32m1(0.0f, 1), vl));
+}
+
+// dst[i * S + j] = src[j * S + i] for an S x S block, S a multiple of 8
+static void gdn_transpose(float * dst, const float * src, int64_t S) {
+    for (int64_t j0 = 0; j0 < S; j0 += 8) {
+        const float * s = src + j0 * S;
+        for (int64_t i = 0; i < S;) {
+            const size_t         vl = __riscv_vsetvl_e32m1(S - i);
+            const vfloat32m1x8_t t  = __riscv_vcreate_v_f32m1x8(
+                __riscv_vle32_v_f32m1(s + 0 * S + i, vl), __riscv_vle32_v_f32m1(s + 1 * S + i, vl),
+                __riscv_vle32_v_f32m1(s + 2 * S + i, vl), __riscv_vle32_v_f32m1(s + 3 * S + i, vl),
+                __riscv_vle32_v_f32m1(s + 4 * S + i, vl), __riscv_vle32_v_f32m1(s + 5 * S + i, vl),
+                __riscv_vle32_v_f32m1(s + 6 * S + i, vl), __riscv_vle32_v_f32m1(s + 7 * S + i, vl));
+            __riscv_vssseg8e32_v_f32m1x8(dst + i * S + j0, (ptrdiff_t) (S * sizeof(float)), t, vl);
+            i += vl;
+        }
+    }
+}
+
+bool forward_gated_delta_net(ggml_compute_params * params, ggml_tensor * op) {
+    const ggml_tensor * src_q     = op->src[0];
+    const ggml_tensor * src_k     = op->src[1];
+    const ggml_tensor * src_v     = op->src[2];
+    const ggml_tensor * src_g     = op->src[3];
+    const ggml_tensor * src_beta  = op->src[4];
+    const ggml_tensor * src_state = op->src[5];
+
+    const int64_t S_v      = src_v->ne[0];
+    const int64_t H        = src_v->ne[1];
+    const int64_t n_tokens = src_v->ne[2];
+    const int64_t n_seqs   = src_v->ne[3];
+    const int64_t K        = ggml_get_op_params_i32(op, 0);
+
+    // per-thread scratch as planned in ggml_graph_plan for the spacemit build
+    const int64_t per_thread = S_v + S_v * S_v;
+
+    if (K != 1 || src_g->ne[0] != 1 || src_q->type != GGML_TYPE_F32 || S_v % 8 != 0 ||
+        S_v > (int64_t) __riscv_vsetvlmax_e32m4() || src_q->nb[0] != sizeof(float) ||
+        src_k->nb[0] != sizeof(float) || src_v->nb[0] != sizeof(float) || !ggml_is_contiguous(src_g) ||
+        !ggml_is_contiguous(src_beta) || !ggml_is_contiguous(src_state) ||
+        params->wsize < (size_t) (params->nth * per_thread) * sizeof(float)) {
+        return false;
+    }
+
+    const int64_t nr  = H * n_seqs;
+    const int64_t dr  = (nr + params->nth - 1) / params->nth;
+    const int64_t ir0 = dr * params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    const int64_t rq3              = src_v->ne[3] / src_q->ne[3];
+    const int64_t rk3              = src_v->ne[3] / src_k->ne[3];
+    const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
+
+    float *       attn_base      = (float *) op->data;
+    float *       state_out_base = attn_base + S_v * H * n_tokens * n_seqs;
+    const float * state_in_base  = (const float *) src_state->data;
+    float *       W              = (float *) params->wdata + params->ith * per_thread + S_v;
+
+    const float  scale = 1.0f / sqrtf((float) S_v);
+    const size_t vl    = __riscv_vsetvl_e32m4(S_v);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t iv1 = ir % H;
+        const int64_t iv3 = ir / H;
+        const int64_t iq1 = iv1 % src_q->ne[1];
+        const int64_t ik1 = iv1 % src_k->ne[1];
+        const int64_t iq3 = iv3 / rq3;
+        const int64_t ik3 = iv3 / rk3;
+
+        const float * s_in  = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        float *       s_out = state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        float *       attn  = attn_base + (iv3 * n_tokens * H + iv1) * S_v;
+
+        auto q_at = [&](int64_t t) {
+            return (const float *) ((const char *) src_q->data + iq3 * src_q->nb[3] + t * src_q->nb[2] + iq1 * src_q->nb[1]);
+        };
+        auto k_at = [&](int64_t t) {
+            return (const float *) ((const char *) src_k->data + ik3 * src_k->nb[3] + t * src_k->nb[2] + ik1 * src_k->nb[1]);
+        };
+        auto v_at = [&](int64_t t) {
+            return (const float *) ((const char *) src_v->data + iv3 * src_v->nb[3] + t * src_v->nb[2] + iv1 * src_v->nb[1]);
+        };
+        auto decay_at = [&](int64_t t) {
+            return expf(*(const float *) ((const char *) src_g->data + iv3 * src_g->nb[3] + t * src_g->nb[2] + iv1 * src_g->nb[1]));
+        };
+        auto beta_at = [&](int64_t t) {
+            return *(const float *) ((const char *) src_beta->data + iv3 * src_beta->nb[3] + t * src_beta->nb[2] + iv1 * src_beta->nb[1]);
+        };
+
+        if (n_tokens < gdn_rowmajor_min_tokens) {
+            const float * s_cur = s_in;
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                const float *      q  = q_at(t);
+                const float *      k  = k_at(t);
+                const float *      v  = v_at(t);
+                const float        d  = decay_at(t);
+                const float        b  = beta_at(t);
+                const float        kq = gdn_dot_f32m4(k, q, vl);
+                const vfloat32m4_t kv = __riscv_vle32_v_f32m4(k, vl);
+                const vfloat32m4_t qv = __riscv_vle32_v_f32m4(q, vl);
+                const vfloat32m1_t z  = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+                float *            o  = attn + t * S_v * H;
+                for (int64_t j = 0; j < S_v; ++j) {
+                    const vfloat32m4_t s  = __riscv_vfmul_vf_f32m4(__riscv_vle32_v_f32m4(s_cur + j * S_v, vl), d, vl);
+                    const float        sk = __riscv_vfmv_f_s_f32m1_f32(
+                        __riscv_vfredusum_vs_f32m4_f32m1(__riscv_vfmul_vv_f32m4(s, kv, vl), z, vl));
+                    const float sq = __riscv_vfmv_f_s_f32m1_f32(
+                        __riscv_vfredusum_vs_f32m4_f32m1(__riscv_vfmul_vv_f32m4(s, qv, vl), z, vl));
+                    const float dj = (v[j] - sk) * b;
+                    __riscv_vse32_v_f32m4(s_out + j * S_v, __riscv_vfmacc_vf_f32m4(s, dj, kv, vl), vl);
+                    o[j] = (sq + dj * kq) * scale;
+                }
+                s_cur = s_out;
+            }
+            continue;
+        }
+
+        gdn_transpose(W, s_in, S_v);
+
+        // accumulators of d S^T k and d S^T q for the next token, split over even/odd rows
+        vfloat32m4_t ak0 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+        vfloat32m4_t aq0 = ak0, ak1 = ak0, aq1 = ak0;
+        {
+            const float * k = k_at(0);
+            const float * q = q_at(0);
+            const float   d = decay_at(0);
+            for (int64_t i = 0; i < S_v; i += 2) {
+                const vfloat32m4_t w0 = __riscv_vle32_v_f32m4(W + i * S_v, vl);
+                const vfloat32m4_t w1 = __riscv_vle32_v_f32m4(W + (i + 1) * S_v, vl);
+                ak0 = __riscv_vfmacc_vf_f32m4(ak0, k[i] * d, w0, vl);
+                aq0 = __riscv_vfmacc_vf_f32m4(aq0, q[i] * d, w0, vl);
+                ak1 = __riscv_vfmacc_vf_f32m4(ak1, k[i + 1] * d, w1, vl);
+                aq1 = __riscv_vfmacc_vf_f32m4(aq1, q[i + 1] * d, w1, vl);
+            }
+        }
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            const float * k  = k_at(t);
+            const float   d  = decay_at(t);
+            const float   kq = gdn_dot_f32m4(k, q_at(t), vl);
+
+            const vfloat32m4_t delta = __riscv_vfmul_vf_f32m4(
+                __riscv_vfsub_vv_f32m4(__riscv_vle32_v_f32m4(v_at(t), vl), __riscv_vfadd_vv_f32m4(ak0, ak1, vl), vl),
+                beta_at(t), vl);
+            __riscv_vse32_v_f32m4(
+                attn + t * S_v * H,
+                __riscv_vfmul_vf_f32m4(__riscv_vfmacc_vf_f32m4(__riscv_vfadd_vv_f32m4(aq0, aq1, vl), kq, delta, vl), scale, vl),
+                vl);
+
+            if (t + 1 < n_tokens) {
+                const float * k1 = k_at(t + 1);
+                const float * q1 = q_at(t + 1);
+                const float   d1 = decay_at(t + 1);
+                ak0 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+                aq0 = ak0;
+                ak1 = ak0;
+                aq1 = ak0;
+                for (int64_t i = 0; i < S_v; i += 2) {
+                    vfloat32m4_t w0 = __riscv_vle32_v_f32m4(W + i * S_v, vl);
+                    vfloat32m4_t w1 = __riscv_vle32_v_f32m4(W + (i + 1) * S_v, vl);
+                    w0 = __riscv_vfmacc_vf_f32m4(__riscv_vfmul_vf_f32m4(w0, d, vl), k[i], delta, vl);
+                    w1 = __riscv_vfmacc_vf_f32m4(__riscv_vfmul_vf_f32m4(w1, d, vl), k[i + 1], delta, vl);
+                    __riscv_vse32_v_f32m4(W + i * S_v, w0, vl);
+                    __riscv_vse32_v_f32m4(W + (i + 1) * S_v, w1, vl);
+                    ak0 = __riscv_vfmacc_vf_f32m4(ak0, k1[i] * d1, w0, vl);
+                    aq0 = __riscv_vfmacc_vf_f32m4(aq0, q1[i] * d1, w0, vl);
+                    ak1 = __riscv_vfmacc_vf_f32m4(ak1, k1[i + 1] * d1, w1, vl);
+                    aq1 = __riscv_vfmacc_vf_f32m4(aq1, q1[i + 1] * d1, w1, vl);
+                }
+            } else {
+                for (int64_t i = 0; i < S_v; ++i) {
+                    const vfloat32m4_t w = __riscv_vfmul_vf_f32m4(__riscv_vle32_v_f32m4(W + i * S_v, vl), d, vl);
+                    __riscv_vse32_v_f32m4(W + i * S_v, __riscv_vfmacc_vf_f32m4(w, k[i], delta, vl), vl);
+                }
+            }
+        }
+
+        gdn_transpose(s_out, W, S_v);
+    }
+    return true;
+}
+
 void forward_unary_tanh_f32(ggml_compute_params * params, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
