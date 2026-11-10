@@ -3096,67 +3096,82 @@ template <typename T> void forward_get_rows(ggml_compute_params * params, ggml_t
     }
 }
 
+template <typename T> static inline void concat_copy_row(char * dst, const char * src, int64_t n, size_t nb) {
+    if (nb == sizeof(T)) {
+        memcpy(dst, src, n * sizeof(T));
+        return;
+    }
+    for (int64_t k = 0; k < n; k++) {
+        ((T *) dst)[k] = *(const T *) (src + k * nb);
+    }
+}
+
+// dim-0 concat for 2- and 4-byte element types, rows split across threads.
+// When src1 is a transposed view (contiguous along dim 1), as for the delta-net conv state
+// concat, blocks of consecutive rows are copied with unit-stride vector loads from src1 and
+// row-strided vector stores into dst, so each source cache line is used in full instead of
+// supplying a single element.
 template <typename T> void forward_concat(ggml_compute_params * params, ggml_tensor * op) {
+    static_assert(sizeof(T) == 2 || sizeof(T) == 4, "forward_concat handles 2- and 4-byte elements");
+
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
     ggml_tensor *       dst  = op;
 
-    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(float));
+    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(T) && ggml_type_size(src1->type) == sizeof(T));
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t dim = ggml_get_op_params_i32(dst, 0);
 
-    GGML_ASSERT(dim == 0 && nb0 == sizeof(float) && nb1 == sizeof(float) * (ne00 + ne10));
+    GGML_ASSERT(dim == 0 && nb0 == sizeof(T));
 
-    const int64_t nr = ggml_nrows(dst);
-    const int64_t nc = ne0;
+    const int64_t nr  = ne1 * ne2 * ne3;
+    const int64_t dr  = (nr + params->nth - 1) / params->nth;
+    const int64_t ir0 = dr * params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    const bool src1_transposed = nb11 == sizeof(T) && nb10 != sizeof(T);
 
-    int rows_nth = nth;
-    int cols_nth = 1;
+    for (int64_t i = ir0; i < ir1;) {
+        const int64_t i3 = i / (ne2 * ne1);
+        const int64_t i2 = (i - i3 * ne2 * ne1) / ne1;
+        const int64_t i1 = i - i3 * ne2 * ne1 - i2 * ne1;
 
-    if (nr == 1) {
-        rows_nth = 1;
-        cols_nth = nth;
-    }
+        char *       d  = (char *) dst->data + i1 * nb1 + i2 * nb2 + i3 * nb3;
+        const char * s0 = (const char *) src0->data + i1 * nb01 + i2 * nb02 + i3 * nb03;
+        const char * s1 = (const char *) src1->data + i1 * nb11 + i2 * nb12 + i3 * nb13;
 
-    const int dr = (nr + rows_nth - 1) / rows_nth;
-    const int dc = (nc + cols_nth - 1) / cols_nth;
-
-    int rows_ith = ith % rows_nth;
-    int cols_ith = ith % cols_nth;
-
-    // row range for this thread
-    const int ir0 = dr * rows_ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    const int cr0 = dc * cols_ith;
-    const int cr1 = MIN(cr0 + dc, nc);
-
-    int64_t o[4] = { 0, 0, 0, 0 };
-    o[dim]       = src0->ne[dim];
-    const float * x;
-
-    for (int64_t i = ir0; i < ir1; ++i) {
-        const int64_t i3 = i / (ne02 * ne01);
-        const int64_t i2 = (i - i3 * ne02 * ne01) / ne01;
-        const int64_t i1 = (i - i3 * ne02 * ne01 - i2 * ne01);
-
-        for (int i0 = cr0; i0 < cr1; i0++) {
-            if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-                x = (const float *) ((const char *) src0->data + (i0) *nb00 + (i1) *nb01 + (i2) *nb02 + (i3) *nb03);
-            } else {
-                x = (const float *) ((const char *) src1->data + (i0 - o[0]) * nb10 + (i1 - o[1]) * nb11 +
-                                     (i2 - o[2]) * nb12 + (i3 - o[3]) * nb13);
-            }
-
-            float * y = (float *) ((char *) dst->data + i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3);
-
-            *y = *x;
+        if (!src1_transposed) {
+            concat_copy_row<T>(d, s0, ne00, nb00);
+            concat_copy_row<T>(d + ne00 * sizeof(T), s1, ne10, nb10);
+            i++;
+            continue;
         }
+
+        // rows i1 .. i1+n-1 of this (i2, i3) plane
+        const int64_t n = MIN(ir1 - i, ne1 - i1);
+        for (int64_t r = 0; r < n; r++) {
+            concat_copy_row<T>(d + r * nb1, s0 + r * nb01, ne00, nb00);
+        }
+        for (int64_t r = 0; r < n;) {
+            size_t vl;
+            if constexpr (sizeof(T) == 4) {
+                vl = __riscv_vsetvl_e32m4(n - r);
+                for (int64_t i0 = 0; i0 < ne10; i0++) {
+                    const vint32m4_t v = __riscv_vle32_v_i32m4((const int32_t *) (s1 + i0 * nb10 + r * nb11), vl);
+                    __riscv_vsse32_v_i32m4((int32_t *) (d + (ne00 + i0) * sizeof(T) + r * nb1), (ptrdiff_t) nb1, v, vl);
+                }
+            } else {
+                vl = __riscv_vsetvl_e16m4(n - r);
+                for (int64_t i0 = 0; i0 < ne10; i0++) {
+                    const vint16m4_t v = __riscv_vle16_v_i16m4((const int16_t *) (s1 + i0 * nb10 + r * nb11), vl);
+                    __riscv_vsse16_v_i16m4((int16_t *) (d + (ne00 + i0) * sizeof(T) + r * nb1), (ptrdiff_t) nb1, v, vl);
+                }
+            }
+            r += vl;
+        }
+        i += n;
     }
 }
 
