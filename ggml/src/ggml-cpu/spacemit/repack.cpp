@@ -7,11 +7,13 @@
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "ime_kernels.h"
+#include "ggml-quants.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 // clang-format off
 #if defined(__riscv)
@@ -1700,6 +1702,55 @@ static int repack_q5_k_to_q5_1_32_bl(ggml_tensor *              t,
     return 0;
 }
 
+// Q5_K -> Q8_0, 32 rows interleaved like repack_q8_0_to_q8_0_32_bl_ref. Each row is dequantized
+// exactly (d * sc * q - dmin * m) and requantized per 32-weight block with its own int8 scale.
+// The Q5_1 layout used before needs an integer zero point, nearbyintf(m / d) clamped to 0..31,
+// which shifts all weights of a block by the same error.
+static int repack_q5_k_to_q8_0_32_bl(ggml_tensor *              t,
+                                     int                        interleave_block,
+                                     const void * GGML_RESTRICT data,
+                                     size_t                     data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q5_K);
+    GGML_ASSERT(interleave_block == 32);
+
+    constexpr int nrows_interleaved = 32;
+
+    const int64_t ne0       = t->ne[0];
+    const int     nrow      = ggml_nrows(t);
+    const int64_t nblocks_k = ne0 / QK_K;
+    const int64_t nblocks   = ne0 / QK8_0;
+
+    if (ne0 % QK_K != 0) {
+        return -1;
+    }
+    GGML_ASSERT(data_size == (size_t) nrow * nblocks_k * sizeof(block_q5_K));
+
+    block_q8_0x32 *         dst = (block_q8_0x32 *) t->data;
+    const block_q5_K *      src = (const block_q5_K *) data;
+    std::vector<float>      row_f32(ne0);
+    std::vector<block_q8_0> rows_q8((size_t) nrows_interleaved * nblocks);
+    block_q8_0              dst_tmp[32];
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        const int64_t nrows_real = std::min((int64_t) nrow - b, (int64_t) nrows_interleaved);
+        for (int64_t i = 0; i < nrows_real; i++) {
+            dequantize_row_q5_K(src + (b + i) * nblocks_k, row_f32.data(), ne0);
+            quantize_row_q8_0_ref(row_f32.data(), rows_q8.data() + i * nblocks, ne0);
+        }
+        for (int64_t x = 0; x < nblocks; x++) {
+            int64_t i = 0;
+            for (; i < nrows_real; i++) {
+                dst_tmp[i] = rows_q8[i * nblocks + x];
+            }
+            for (; i < nrows_interleaved; i++) {
+                memset(&dst_tmp[i], 0, sizeof(block_q8_0));
+            }
+            *dst++ = make_block_q8_0x32(dst_tmp, interleave_block);
+        }
+    }
+    return 0;
+}
+
 namespace ggml::cpu::riscv64_spacemit {
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> int repack(ggml_tensor *, const void *, size_t);
@@ -1789,7 +1840,7 @@ template <> int repack<block_q5_1, 32, 32>(ggml_tensor * t, const void * data, s
 }
 
 template <> int repack<block_q5_K, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
-    return repack_q5_k_to_q5_1_32_bl(t, 32, data, data_size);
+    return repack_q5_k_to_q8_0_32_bl(t, 32, data, data_size);
 }
 
 }  // namespace ggml::cpu::riscv64_spacemit
