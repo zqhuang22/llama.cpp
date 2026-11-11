@@ -3403,6 +3403,58 @@ bool forward_gated_delta_net(ggml_compute_params * params, ggml_tensor * op) {
     return true;
 }
 
+// ---- SSM_CONV, d_conv = 4 ----
+// Vectorized over channels: for each token one strided segment load fetches the 4-tap window
+// x[c][t..t+3] of vl channels (each channel's window is contiguous over time), then four
+// multiply-adds with the channel weights and one unit-stride store into the channel-contiguous
+// output. The generic loop does a scalar 4-tap dot per (token, channel) and, walking the
+// channels for a fixed token, touches a new cache line of x for every output.
+bool forward_ssm_conv(ggml_compute_params * params, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];  // conv_x {d_conv - 1 + n_t, d_inner, n_s}
+    const ggml_tensor * src1 = op->src[1];  // weight {d_conv, d_inner}
+
+    // A single token (decode) leaves x fully contiguous, where the generic scalar loop is faster
+    // than strided segment loads (17.8 vs 25.6 us per call measured in llama.cpp).
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || src1->ne[0] != 4 ||
+        src0->nb[0] != sizeof(float) || src1->nb[0] != sizeof(float) || op->nb[0] != sizeof(float) || op->ne[1] == 1) {
+        return false;
+    }
+
+    const int64_t nr  = src0->ne[1];
+    const int64_t n_t = op->ne[1];
+    const int64_t n_s = op->ne[2];
+
+    const int64_t dr  = (nr + params->nth - 1) / params->nth;
+    const int64_t ir0 = dr * params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t i3 = 0; i3 < n_s; ++i3) {
+        for (int64_t c = ir0; c < ir1;) {
+            const size_t         vl = __riscv_vsetvl_e32m2(ir1 - c);
+            const vfloat32m2x4_t wt = __riscv_vlsseg4e32_v_f32m2x4(
+                (const float *) ((const char *) src1->data + c * src1->nb[1]), (ptrdiff_t) src1->nb[1], vl);
+            const vfloat32m2_t w0 = __riscv_vget_v_f32m2x4_f32m2(wt, 0);
+            const vfloat32m2_t w1 = __riscv_vget_v_f32m2x4_f32m2(wt, 1);
+            const vfloat32m2_t w2 = __riscv_vget_v_f32m2x4_f32m2(wt, 2);
+            const vfloat32m2_t w3 = __riscv_vget_v_f32m2x4_f32m2(wt, 3);
+
+            const char * s = (const char *) src0->data + c * src0->nb[1] + i3 * src0->nb[2];
+            char *       o = (char *) op->data + c * sizeof(float) + i3 * op->nb[2];
+            for (int64_t t = 0; t < n_t; ++t) {
+                const vfloat32m2x4_t xt =
+                    __riscv_vlsseg4e32_v_f32m2x4((const float *) (s + t * sizeof(float)), (ptrdiff_t) src0->nb[1], vl);
+                vfloat32m2_t y = __riscv_vfmul_vv_f32m2(__riscv_vget_v_f32m2x4_f32m2(xt, 0), w0, vl);
+                y = __riscv_vfmacc_vv_f32m2(y, __riscv_vget_v_f32m2x4_f32m2(xt, 1), w1, vl);
+                y = __riscv_vfmacc_vv_f32m2(y, __riscv_vget_v_f32m2x4_f32m2(xt, 2), w2, vl);
+                y = __riscv_vfmacc_vv_f32m2(y, __riscv_vget_v_f32m2x4_f32m2(xt, 3), w3, vl);
+                __riscv_vse32_v_f32m2((float *) (o + t * op->nb[1]), y, vl);
+            }
+            c += vl;
+        }
+    }
+    return true;
+}
+
 void forward_unary_tanh_f32(ggml_compute_params * params, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;

@@ -72,6 +72,9 @@ template <typename T> void forward_concat(ggml_compute_params * params, ggml_ten
 // Returns false without touching anything when the op is outside the supported subset
 // (K = 1, scalar gate, f32, head size a multiple of 8 that fits one e32m4 register).
 bool forward_gated_delta_net(ggml_compute_params * params, ggml_tensor * op);
+// Returns false without touching anything unless d_conv == 4, n_t > 1 and everything is f32
+// with contiguous rows.
+bool forward_ssm_conv(ggml_compute_params * params, ggml_tensor * op);
 
 template <ggml_op op_type, typename T> void forward_binary(ggml_compute_params * params, ggml_tensor * op);
 

@@ -1216,6 +1216,11 @@ class tensor_traits_common : public tensor_traits_base {
                     ggml_compute_forward_gated_delta_net(params, op);
                 }
                 return true;
+            case GGML_OP_SSM_CONV:
+                if (!spacemit_kernels::rvv::forward_ssm_conv(params, op)) {
+                    ggml_compute_forward_ssm_conv(params, op);
+                }
+                return true;
             default:
                 break;
         }
@@ -1711,6 +1716,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             case GGML_OP_GET_ROWS:
             case GGML_OP_CONCAT:
             case GGML_OP_GATED_DELTA_NET:
+            case GGML_OP_SSM_CONV:
                 return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
             case GGML_OP_UNARY:
                 if (ggml_get_unary_op(op) == GGML_UNARY_OP_TANH && op->src[0]->type == GGML_TYPE_F32 &&
