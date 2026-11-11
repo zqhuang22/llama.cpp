@@ -83,7 +83,8 @@ struct TLSContext {
 thread_local TLSContext tls_context;
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> constexpr size_t get_repacked_block_type_size() {
-    if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
+    if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0> ||
+                  std::is_same_v<BLOC_TYPE, block_q5_K>) {
         return sizeof(block_q8_0);
     } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0>) {
         return sizeof(block_q4_0) * INTER_SIZE / QK4_0;
@@ -95,7 +96,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> constexpr siz
         return sizeof(spacemit_kernels::nrow_block_q3_k<1>);
     } else if constexpr (std::is_same_v<BLOC_TYPE, block_mxfp4>) {
         return sizeof(spacemit_kernels::nrow_block_mxfp4<1>);
-    } else if constexpr (std::is_same_v<BLOC_TYPE, block_q5_1> || std::is_same_v<BLOC_TYPE, block_q5_K>) {
+    } else if constexpr (std::is_same_v<BLOC_TYPE, block_q5_1>) {
         return sizeof(spacemit_kernels::nrow_block_q5_1<1>);
     } else if constexpr (std::is_same_v<BLOC_TYPE, block_q5_0>) {
         return sizeof(spacemit_kernels::nrow_block_q5_0<1>);
@@ -107,6 +108,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> constexpr siz
 
 template <typename BLOC_TYPE> constexpr bool block_type_has_zp() {
     if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0> ||
+                  std::is_same_v<BLOC_TYPE, block_q5_K> ||
                   std::is_same_v<BLOC_TYPE, block_q3_K> || std::is_same_v<BLOC_TYPE, block_q4_0> ||
                   std::is_same_v<BLOC_TYPE, block_mxfp4> || std::is_same_v<BLOC_TYPE, block_q5_0>) {
         return false;
@@ -270,7 +272,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8;
             block_stride_a     = spacemit_kernels::q8_blk_size(a_blk_len, true);
 
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0> ||
+                  std::is_same_v<BLOC_TYPE, block_q5_K>) {
                 gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i8;
                 set_kernel_impl = true;
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
@@ -305,7 +308,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_mxfp4>) {
                 gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8mxfp4;
                 set_kernel_impl = true;
-            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q5_1> || std::is_same_v<BLOC_TYPE, block_q5_K> ||
+            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q5_1> ||
                                  std::is_same_v<BLOC_TYPE, block_q5_0>) {
                 gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i5;
                 set_kernel_impl = true;
@@ -615,7 +618,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             quantize_a_row_i8 = spacemit_kernels::rvv::quantize_a_row_i8;
             block_stride_a    = spacemit_kernels::q8_blk_size(QK4_0, true);
 
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0> ||
+                  std::is_same_v<BLOC_TYPE, block_q5_K>) {
                 gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i8;
                 set_kernel_impl = true;
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
@@ -646,7 +650,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8mxfp4;
                 moe_gemm_kernel_m2 = spacemit_kernels::ime2::moe_m2_gemm_kernel_i8mxfp4;
                 set_kernel_impl    = true;
-            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q5_1> || std::is_same_v<BLOC_TYPE, block_q5_K> ||
+            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q5_1> ||
                                  std::is_same_v<BLOC_TYPE, block_q5_0>) {
                 gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i5;
                 moe_gemm_kernel_m2 = spacemit_kernels::ime2::moe_m2_gemm_kernel_i8i5;
@@ -1349,10 +1353,14 @@ static const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack
         case GGML_TYPE_Q4_0:
             {
 #if defined(RISCV64_SPACEMIT_IME2)
-                if (cur->ne[1] % 32 == 0 && cur->ne[0] % 256 == 0 &&
-                    (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
-                    return &ggml::cpu::riscv64_spacemit::q4_0_32x256_q8_0;
-                }
+                // The q4_0_32x256 "hp" path is not used: it keeps relative activation scales and the
+                // sub-block partial sums in fp16 and accumulates unsigned 0..15 weights in int16, which
+                // costs too much accuracy (qwen35-0.8B PPL 8.4 vs 4.4 for the generic CPU path, mostly
+                // from ffn_down). q4_0_32x32 below is about as fast.
+                // if (cur->ne[1] % 32 == 0 && cur->ne[0] % 256 == 0 &&
+                //     (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
+                //     return &ggml::cpu::riscv64_spacemit::q4_0_32x256_q8_0;
+                // }
 
                 if (cur->ne[1] % 32 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q4_0_32x32_q8_0;
@@ -1405,7 +1413,8 @@ static const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack
         case GGML_TYPE_Q6_K:
             {
 #if defined(RISCV64_SPACEMIT_IME2)
-                if ((ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
+                // the kernel works on 32-row tiles; other row counts fall back to the generic matmul
+                if (cur->ne[1] % 32 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q6_k_32x32_q8_0;
                 }
 #endif
@@ -1414,7 +1423,8 @@ static const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack
         case GGML_TYPE_Q8_0:
             {
 #if defined(RISCV64_SPACEMIT_IME2)
-                if ((ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
+                // the kernel works on 32-row tiles; other row counts fall back to the generic matmul
+                if (cur->ne[1] % 32 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q8_0_32x32_q8_0;
                 }
 #endif
@@ -1639,7 +1649,8 @@ static size_t ggml_backend_cpu_riscv64_spacemit_nbytes(ggml_backend_buffer_type_
             nbytes = remap_block_nbytes(sizeof(block_mxfp4), sizeof(spacemit_kernels::nrow_block_mxfp4<1>));
             break;
         case GGML_TYPE_Q5_K:
-            nbytes = remap_block_nbytes(sizeof(block_q5_K), sizeof(spacemit_kernels::nrow_block_q5_1<1>) * 8);
+            // Q5_K is requantized to Q8_0 (see repack_q5_k_to_q8_0_32_bl)
+            nbytes = remap_block_nbytes(sizeof(block_q5_K), sizeof(block_q8_0) * 8, 32);
             break;
         case GGML_TYPE_Q5_1:
             nbytes = remap_block_nbytes(sizeof(block_q5_1), sizeof(spacemit_kernels::nrow_block_q5_1<1>));
